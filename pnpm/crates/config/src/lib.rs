@@ -11,6 +11,7 @@ mod override_version_references;
 pub mod property_path;
 pub mod protected_settings;
 pub mod proxy_keys;
+pub mod refused_keys;
 mod store_path;
 pub mod version_policy;
 mod workspace_yaml;
@@ -40,11 +41,11 @@ use std::{
 };
 
 pub use crate::defaults::{
-    GLOBAL_LAYOUT_VERSION, PNPM_VERSION, available_parallelism, default_cache_dir,
-    default_config_dir, default_git_shallow_hosts, default_peers_suffix_max_length,
-    default_pnpm_home_dir, default_registry, default_state_dir, default_unsafe_perm,
-    default_virtual_store_dir_max_length, default_workspace_concurrency, is_unsafe_perm_posix,
-    resolve_child_concurrency,
+    BUILTIN_REGISTRIES_BY_PREFIX, DEFAULT_JSR_REGISTRY, GLOBAL_LAYOUT_VERSION, PNPM_VERSION,
+    available_parallelism, default_cache_dir, default_config_dir, default_git_shallow_hosts,
+    default_peers_suffix_max_length, default_pnpm_home_dir, default_registry, default_state_dir,
+    default_unsafe_perm, default_virtual_store_dir_max_length, default_workspace_concurrency,
+    is_unsafe_perm_posix, resolve_child_concurrency,
 };
 use crate::defaults::{
     default_child_concurrency, default_enable_global_virtual_store, default_fetch_retries,
@@ -353,6 +354,18 @@ impl PmOnFail {
             Self::Ignore => "ignore",
         }
     }
+}
+
+/// The module system `pnpm init` records for the package it scaffolds.
+///
+/// `module` writes `"type": "module"`; `commonjs` is Node's default and
+/// leaves the field out of the manifest.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InitType {
+    #[default]
+    Module,
+    Commonjs,
 }
 
 /// What to do when a runtime declared through `devEngines.runtime` or
@@ -784,8 +797,10 @@ pub enum CatalogMode {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PackageImportMethod {
-    ///  try to clone packages from the store. If cloning is not supported then hardlink packages
-    /// from the store. If neither cloning nor linking is possible, fall back to copying
+    /// Try the platform's cheap link tiers in order — hardlink first on
+    /// Linux, clone first elsewhere — and fall back to copying when none
+    /// is possible. `deps-restorer::link_file::next_auto_tier` implements
+    /// the ladder and carries the rationale.
     #[default]
     Auto,
 
@@ -1912,6 +1927,22 @@ pub struct Config {
     /// [`TrustPolicy`].
     pub trust_policy: TrustPolicy,
 
+    /// `init-package-manager` / `initPackageManager` config: whether
+    /// `pnpm init` pins the running pnpm in the manifest it scaffolds,
+    /// through both `devEngines.packageManager` and the legacy
+    /// `packageManager` field. Only the workspace root is pinned — a
+    /// member of an existing workspace inherits the root's pin.
+    ///
+    /// Defaults to `true`.
+    #[default = true]
+    pub init_package_manager: bool,
+
+    /// `init-type` / `initType` config: the module system `pnpm init`
+    /// records for the package it scaffolds. See [`InitType`].
+    ///
+    /// Defaults to `module`.
+    pub init_type: InitType,
+
     /// `pm-on-fail` / `pmOnFail` config: what to do when the project's
     /// `packageManager` / `devEngines.packageManager` pin doesn't match the
     /// running pnpm. See [`PmOnFail`]. Stays optional so the
@@ -2133,12 +2164,67 @@ impl Config {
     /// own `registry` field.
     #[must_use]
     pub fn registry_declarations(&self) -> BTreeMap<String, RegistryDeclaration> {
-        registries::to_declarations(&RegistryLookups {
+        registries::to_declarations(&self.registry_lookups(None))
+    }
+
+    /// The registries this config resolves from, merged across every source,
+    /// in the shape the `registries` setting is written in — the view
+    /// `pnpm config get registries` prints. Unlike
+    /// [`Self::registry_declarations`], nothing is omitted: the default
+    /// registry is declared as the bare `@` scope, and the built-in routes —
+    /// the `@jsr` scope and the [`BUILTIN_REGISTRIES_BY_PREFIX`] prefixes —
+    /// are declared too, unless the user pointed them elsewhere.
+    #[must_use]
+    pub fn resolved_registry_declarations(&self) -> BTreeMap<String, RegistryDeclaration> {
+        let mut lookups = self.registry_lookups(Some(self.registry.clone()));
+        lookups
+            .registries_by_scope
+            .entry("@jsr".to_string())
+            .or_insert_with(|| DEFAULT_JSR_REGISTRY.to_string());
+        for (prefix, registry) in BUILTIN_REGISTRIES_BY_PREFIX {
+            lookups
+                .registries_by_prefix
+                .entry((*prefix).to_string())
+                .or_insert_with(|| (*registry).to_string());
+        }
+        registries::to_resolved_declarations(&lookups)
+    }
+
+    fn registry_lookups(&self, default_registry: Option<String>) -> RegistryLookups {
+        RegistryLookups {
             registries_by_scope: self.registries_by_scope.clone(),
-            default_registry: None,
+            default_registry,
             registries_by_prefix: self.registries_by_prefix.clone(),
             registry_options_by_url: self.registry_options_by_url.clone(),
-        })
+        }
+    }
+
+    /// The `update` settings the CLI acts on, re-joined from
+    /// [`Self::update_config`] — the view `pnpm config get update` prints.
+    /// `None` when nothing is set.
+    #[must_use]
+    pub fn resolved_update_settings(&self) -> Option<UpdateSettings> {
+        let update = UpdateSettings {
+            ignore_deps: self.update_config.ignore_dependencies.clone(),
+            changeset: self.update_config.changeset,
+            github_actions: self.update_config.github_actions,
+            github_actions_server: self.update_config.github_actions_server.clone(),
+        };
+        (update != UpdateSettings::default()).then_some(update)
+    }
+
+    /// The `audit` settings the CLI acts on, re-joined from
+    /// [`Self::audit_level`] and [`Self::audit_config`] — the view
+    /// `pnpm config get audit` prints. An empty ignore list reads as unset.
+    /// `None` when nothing is set.
+    #[must_use]
+    pub fn resolved_audit_settings(&self) -> Option<AuditSettings> {
+        let audit = AuditSettings {
+            level: self.audit_level,
+            ignore: (!self.audit_config.ignore_ghsas.is_empty())
+                .then(|| self.audit_config.ignore_ghsas.clone()),
+        };
+        (audit != AuditSettings::default()).then_some(audit)
     }
 
     /// Overlay the CLI's proxy flags onto the merged keys and re-resolve.
@@ -3106,6 +3192,12 @@ fn collect_explicit_settings(
             "enableGlobalVirtualStore".to_string(),
             serde_json::Value::Bool(virtual_store_type.is_global()),
         );
+    }
+    // `audit.level` supersedes the deprecated `auditLevel` spelling; mirror it
+    // there so `config get audit-level` answers the way pnpm does.
+    if let Some(level) = settings.audit.as_ref().and_then(|audit| audit.level) {
+        let Ok(level) = serde_json::to_value(level) else { return };
+        target.insert("auditLevel".to_string(), level);
     }
 }
 

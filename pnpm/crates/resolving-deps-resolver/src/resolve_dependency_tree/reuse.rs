@@ -372,7 +372,7 @@ pub(crate) fn unwrap_package_name<'a>(
 ///
 /// `None` when no name can be recovered; the caller reads that as "not
 /// a targeted update", since update targets are keyed by package name.
-pub(super) fn real_package_name_of<'edge>(
+pub fn real_package_name_of<'edge>(
     alias: Option<&'edge str>,
     bare_specifier: Option<&'edge str>,
 ) -> Option<Cow<'edge, str>> {
@@ -396,6 +396,29 @@ pub(super) fn real_package_name_of<'edge>(
         return Some(Cow::Owned(spec.npm_pkg_name));
     }
     alias.map(Cow::Borrowed)
+}
+
+/// Whether the running `pacquet update` reaches this edge, so its
+/// locked-version pin must not survive — the update exists to move it.
+/// Unlike [`fn@is_update_target`], an update-everything scope
+/// ([`UpdateReuseScope::None`]) unpins every edge the depth ceiling
+/// reaches.
+pub(super) fn update_unpins_edge(
+    scope: UpdateScope<'_>,
+    wanted: &WantedDependency,
+    depth: i32,
+) -> bool {
+    if !scope.max_depth.reaches(depth) {
+        return false;
+    }
+    match scope.reuse {
+        UpdateReuseScope::All => false,
+        UpdateReuseScope::None => true,
+        UpdateReuseScope::Except(_) => {
+            real_package_name_of(wanted.alias.as_deref(), wanted.bare_specifier.as_deref())
+                .is_some_and(|name| update_excludes(scope, name.as_ref(), depth))
+        }
+    }
 }
 
 /// Whether `wanted` is one of the packages the user asked to update,

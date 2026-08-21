@@ -91,6 +91,11 @@ pub struct InstallWithFreshLockfile<'a, DependencyGroupList> {
     /// non-workspace install this carries a single `"."` entry
     /// pointing at the only project.
     pub importer_manifests: BTreeMap<String, &'a PackageManifest>,
+    /// Optional per-importer manifest source used only when serializing
+    /// importer specifiers into the lockfile. `update --no-save` resolves
+    /// against an in-memory manifest rewrite, while the lockfile importer
+    /// entry must still reflect the kept on-disk manifest.
+    pub lockfile_specifier_manifests: Option<BTreeMap<String, PackageManifest>>,
     pub dependency_groups: DependencyGroupList,
     /// Install-scoped dedupe state for `pnpm:package-import-method`.
     /// See `link_file::log_method_once`.
@@ -687,6 +692,13 @@ pub struct InstallWithFreshLockfileResult {
     /// Installability-skipped optional snapshots. The outer install
     /// writer persists these into `.modules.yaml.skipped`.
     pub skipped: SkippedSnapshots,
+    /// The store-index writer task, already winding down — see
+    /// [`pnpm_deps_restorer::InstallFrozenLockfileOutput::store_index_teardown`]:
+    /// every handle was dropped, the task is flushing its final batch
+    /// and closing its `SQLite` connection (a WAL checkpoint). Await it
+    /// via [`pnpm_store_dir::StoreIndexWriter::drain`] as late as
+    /// possible so the close overlaps the caller's tail writes.
+    pub store_index_teardown: tokio::task::JoinHandle<Result<(), pnpm_store_dir::StoreIndexError>>,
 }
 
 impl<DependencyGroupList> InstallWithFreshLockfile<'_, DependencyGroupList> {
@@ -709,6 +721,7 @@ impl<DependencyGroupList> InstallWithFreshLockfile<'_, DependencyGroupList> {
             http_client_arc,
             config,
             importer_manifests,
+            lockfile_specifier_manifests,
             dependency_groups,
             // No longer consulted: `CreateVirtualStore`'s warm/cold-batch
             // shape dedups by snapshot key inside the rayon pass. Kept on
@@ -1036,6 +1049,13 @@ impl<DependencyGroupList> InstallWithFreshLockfile<'_, DependencyGroupList> {
             &update_reuse_scope,
             &update_reuse_scopes_by_importer,
         );
+        let reuse_lockfile_subtrees = lockfile_reuse_seed.is_some();
+        // A withheld seed means config drift the fast rewrites cannot
+        // absorb, so recorded subtrees must re-resolve — but the prior
+        // lockfile still pins the edges the drift does not reach (see
+        // `WorkspaceResolveOptions::reuse_lockfile_subtrees`).
+        let resolution_lockfile = lockfile_reuse_seed
+            .or_else(|| wanted_lockfile.map(|lockfile| Arc::new(lockfile.clone())));
 
         let phase_start = std::time::Instant::now();
         Reporter::emit(&LogEvent::Stage(StageLog {
@@ -1062,7 +1082,8 @@ impl<DependencyGroupList> InstallWithFreshLockfile<'_, DependencyGroupList> {
             pick_lowest_direct,
             time_based,
             published_by,
-            lockfile_reuse_seed,
+            resolution_lockfile,
+            reuse_lockfile_subtrees,
             update_reuse_scope,
             update_reuse_scopes_by_importer,
             update_depth: update_seed_policy.max_depth(),
@@ -1193,6 +1214,7 @@ impl<DependencyGroupList> InstallWithFreshLockfile<'_, DependencyGroupList> {
             let built_lockfile = build_lockfile(FreshLockfileBuildOptions {
                 config,
                 importer_manifests: &importer_manifests,
+                lockfile_specifier_manifests: lockfile_specifier_manifests.as_ref(),
                 graph: &merged_graph,
                 direct_by_importer: &direct_by_importer,
                 resolved_overrides: resolved_overrides.clone(),
@@ -1224,56 +1246,6 @@ impl<DependencyGroupList> InstallWithFreshLockfile<'_, DependencyGroupList> {
             .await;
         }
 
-        // Warm-cache batched prefetch: collect every `(integrity,
-        // pkg_id)` pair the resolver produced, run one batched SQL
-        // `SELECT ... WHERE key IN (...)` against the store index,
-        // then verify each row's files on rayon. Mirrors what
-        // `create_virtual_store::run` already does for the frozen-
-        // lockfile path. The store_index, store_index_writer, and
-        // verified_files_cache are opened earlier (above the resolver
-        // chain) so the [`PrefetchingResolver`][crate::PrefetchingResolver] can share them; this
-        // batched prefetch reuses the same handles to fold the
-        // per-package SQL lookups the install pass would otherwise
-        // serialize on `Arc<Mutex<StoreIndex>>` for warm packages
-        // that weren't reached by the resolve-time prefetch (e.g.
-        // resolutions without a structured `name@version`).
-        let cache_keys: Vec<String> = if filtered_isolated {
-            Vec::new()
-        } else {
-            collect_prefetch_cache_keys_from_graph(&merged_graph)
-        };
-        let cache_keys_len = cache_keys.len();
-        let phase_start = std::time::Instant::now();
-        let prefetch = pnpm_tarball::prefetch_cas_paths(
-            store_index_ref.cloned(),
-            store_dir,
-            cache_keys,
-            config.verify_store_integrity,
-            SharedVerifiedFilesCache::clone(&verified_files_cache),
-        )
-        .await;
-        // `side_effects_maps` is intentionally dropped: the fresh-
-        // lockfile path skips the build phase today (see the
-        // `importing_done` emit at the tail of this function), so
-        // there is no `is_built` gate to feed. Keep the binding name
-        // explicit so a future port that wires builds in does not
-        // miss the source.
-        let pnpm_tarball::PrefetchResult {
-            cas_paths: prefetched_cas_paths,
-            manifests: prefetched_manifests,
-            side_effects_maps: _,
-            requires_build: _,
-        } = prefetch;
-        tracing::info!(
-            target: "pacquet::install::phase",
-            phase = "prefetch_cas_paths",
-            elapsed_ms = phase_start.elapsed().as_millis() as u64,
-            cache_keys = cache_keys_len,
-            hits = prefetched_cas_paths.len(),
-            manifest_hits = prefetched_manifests.len(),
-            "phase complete",
-        );
-
         let allow_build_policy = AllowBuildPolicy::from_config(config)
             .map_err(InstallWithFreshLockfileError::AllowBuildsPolicy)?;
         // Built unconditionally: the layout and the bin-link pass both
@@ -1284,6 +1256,7 @@ impl<DependencyGroupList> InstallWithFreshLockfile<'_, DependencyGroupList> {
         let built_lockfile = build_lockfile(FreshLockfileBuildOptions {
             config,
             importer_manifests: &importer_manifests,
+            lockfile_specifier_manifests: lockfile_specifier_manifests.as_ref(),
             graph: &merged_graph,
             direct_by_importer: &direct_by_importer,
             resolved_overrides: resolved_overrides.clone(),
@@ -1438,6 +1411,7 @@ impl<DependencyGroupList> InstallWithFreshLockfile<'_, DependencyGroupList> {
             // `requiresBuild` decision per snapshot.
             side_effects_maps_by_snapshot,
             requires_build_by_snapshot,
+            materialized_snapshots,
             // Optional snapshots whose fetch was swallowed. Folded into
             // the live skip set below so the symlink, bin-link, and build
             // phases observe them as absent — matching the frozen path
@@ -1459,6 +1433,10 @@ impl<DependencyGroupList> InstallWithFreshLockfile<'_, DependencyGroupList> {
             logged_methods,
             requester,
             store_index_writer: &store_index_writer,
+            store_context: Some(pnpm_deps_restorer::CreateVirtualStoreStoreContext {
+                index: store_index_ref,
+                verified_files_cache: &verified_files_cache,
+            }),
             allow_build_policy: &allow_build_policy,
             skipped: &skipped,
             include_optional_dependencies: include_transitive_optional_dependencies,
@@ -1552,6 +1530,7 @@ impl<DependencyGroupList> InstallWithFreshLockfile<'_, DependencyGroupList> {
                 lockfile: materialization_lockfile,
                 current_lockfile,
                 snapshots: materialization_lockfile.snapshots.as_ref(),
+                materialized_snapshots: Some(&materialized_snapshots),
                 packages: materialization_lockfile.packages.as_ref(),
                 importers: &materialization_lockfile.importers,
                 project_manifests: &project_manifests_for_link,
@@ -1631,6 +1610,7 @@ impl<DependencyGroupList> InstallWithFreshLockfile<'_, DependencyGroupList> {
                     allow_build_policy: &allow_build_policy,
                     side_effects_maps_by_snapshot: &side_effects_maps_by_snapshot,
                     requires_build_by_snapshot: &requires_build_by_snapshot,
+                    materialized_snapshots: &materialized_snapshots,
                     engine_name: engine_name.as_deref(),
                     extra_env: &build_extra_env,
                     store_index_writer: &store_index_writer,
@@ -1647,15 +1627,12 @@ impl<DependencyGroupList> InstallWithFreshLockfile<'_, DependencyGroupList> {
             )
             .map_err(InstallWithFreshLockfileError::BuildPhase)?;
 
-        // Drop the orchestration's writer handle so the channel closes,
-        // then wait for the final batch flush — now including any
-        // side-effects-cache rows the build phase queued. Errors are
-        // downgraded to `warn!` (see `create_virtual_store.rs`): the
-        // install is complete and a missed cache write just forces a
-        // re-fetch on the next install.
+        // Drop the orchestration's writer handle so the channel closes
+        // once the build phase's side-effects-cache rows are queued and
+        // the task starts winding down. It is returned as
+        // `store_index_teardown` and awaited by the install driver
+        // after the tail writes it overlaps.
         drop(store_index_writer);
-        pnpm_store_dir::StoreIndexWriter::drain(writer_task, "; some rows may not be persisted")
-            .await;
 
         let injected_deps = crate::collect_injected_deps(
             &layout,
@@ -1695,6 +1672,7 @@ impl<DependencyGroupList> InstallWithFreshLockfile<'_, DependencyGroupList> {
             ignored_builds,
             deferred_builds,
             skipped,
+            store_index_teardown: writer_task,
         })
     }
 }
@@ -1714,48 +1692,6 @@ fn include_transitive_optional_dependencies(
     dependency_groups: &[DependencyGroup],
 ) -> bool {
     !is_full_install || dependency_groups.contains(&DependencyGroup::Optional)
-}
-
-/// Walk the merged resolver graph and emit the `{integrity}\t{pkg_id}`
-/// cache keys [`pnpm_tarball::prefetch_cas_paths`] uses for its
-/// batched `SELECT ... WHERE key IN (...)` against the store index.
-/// Mirrors the equivalent collection loop in
-/// [`crate::CreateVirtualStore::run`] for the frozen-lockfile path —
-/// same key shape, same dedup, so the fresh-lockfile path's warm
-/// batch hits the same rows pnpm or pacquet wrote on the prior
-/// install.
-///
-/// Skips nodes whose resolver result isn't a non-git-hosted tarball
-/// with an `integrity`: git-hosted tarballs and directory / git /
-/// binary resolutions use a different key shape (`pkg_id`-only) and
-/// route through the cold path.
-fn collect_prefetch_cache_keys_from_graph(
-    graph: &pnpm_resolving_deps_resolver::DependenciesGraph,
-) -> Vec<String> {
-    let mut keys: Vec<String> = graph
-        .values()
-        .filter_map(|node| {
-            let pnpm_lockfile::LockfileResolution::Tarball(tarball) =
-                &node.resolve_result.resolution
-            else {
-                return None;
-            };
-            if tarball.git_hosted == Some(true) {
-                return None;
-            }
-            let integrity = tarball.integrity.as_ref()?.to_string();
-            // The node's dep path carries the same `name@<id>` shape the
-            // lockfile records, so stripping it yields the `pkg_id` the
-            // install pass and the resolve-time fetch address the row by
-            // — `name@version` for a registry package, the bare URL for a
-            // remote tarball.
-            let pkg_id = pnpm_deps_path::try_get_package_id(node.dep_path.as_str());
-            Some(pnpm_store_dir::store_index_key(&integrity, &pkg_id))
-        })
-        .collect();
-    keys.sort_unstable();
-    keys.dedup();
-    keys
 }
 
 /// Build the `context.log(...)` sink a pnpmfile hook forwards to: each
@@ -1930,9 +1866,9 @@ async fn finish_lockfile_only<Reporter: self::Reporter>(
     };
 
     // Close the writer cleanly even though no rows were written,
-    // mirroring the drain at the tail of the materializing path.
+    // mirroring the materializing path: drop closes the channel, the
+    // caller awaits the returned task after its own tail writes.
     drop(store_index_writer);
-    pnpm_store_dir::StoreIndexWriter::drain(writer_task, " during a lockfile-only install").await;
 
     Reporter::emit(&LogEvent::Stage(StageLog {
         level: LogLevel::Debug,
@@ -1948,6 +1884,7 @@ async fn finish_lockfile_only<Reporter: self::Reporter>(
         ignored_builds: Vec::new(),
         deferred_builds: Vec::new(),
         skipped: SkippedSnapshots::new(),
+        store_index_teardown: writer_task,
     })
 }
 
@@ -2047,6 +1984,7 @@ fn compose_manifest_hooks(
 struct FreshLockfileBuildOptions<'a> {
     config: &'a Config,
     importer_manifests: &'a BTreeMap<String, &'a PackageManifest>,
+    lockfile_specifier_manifests: Option<&'a BTreeMap<String, PackageManifest>>,
     graph: &'a pnpm_resolving_deps_resolver::DependenciesGraph,
     direct_by_importer:
         &'a BTreeMap<String, BTreeMap<String, pnpm_resolving_deps_resolver::DepPath>>,
@@ -2126,6 +2064,7 @@ fn build_fresh_lockfile(
         resolved_time,
         config,
         importer_manifests,
+        lockfile_specifier_manifests,
         graph,
         direct_by_importer,
         resolved_overrides,
@@ -2140,6 +2079,9 @@ fn build_fresh_lockfile(
     let mut importers = BTreeMap::new();
     for (id, manifest) in importer_manifests {
         let direct = direct_by_importer.get(id).cloned().unwrap_or_default();
+        let manifest = lockfile_specifier_manifests
+            .and_then(|manifests| manifests.get(id))
+            .unwrap_or(*manifest);
         importers.insert(
             id.clone(),
             ImporterLockfileInput { manifest, direct_dependencies_by_alias: direct },

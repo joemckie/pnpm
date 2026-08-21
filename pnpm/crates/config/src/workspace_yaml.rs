@@ -1,10 +1,13 @@
 use crate::{
-    AuditConfig, AuditLevel, CatalogMode, Config, HoistingLimits, LinkWorkspacePackages,
+    AuditConfig, AuditLevel, CatalogMode, Config, HoistingLimits, InitType, LinkWorkspacePackages,
     NodeLinker, NodePackageMapType, PackageImportMethod, PmOnFail, ResolutionMode, RuntimeOnFail,
     SaveWorkspaceProtocol, ScriptsPrependNodePath, TrustPolicy, VerifyDepsBeforeRun,
     VirtualStoreType,
     api::EnvVar,
+    config_types::is_config_file_key,
+    naming_cases::{is_camel_case, to_camel_case, to_kebab_case},
     proxy_keys::{ProxyKeys, ProxyValue},
+    refused_keys::{is_refused_by_a_project_manifest, where_refused_key_belongs},
     resolve_child_concurrency,
 };
 use derive_more::{Display, Error};
@@ -17,7 +20,7 @@ use pnpm_package_is_installable::SupportedArchitectures;
 use pnpm_store_dir::StoreDir;
 use pnpm_workspace_state::ConfigDependency;
 use registries::RegistryEntry;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, de::IgnoredAny};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs,
@@ -143,9 +146,10 @@ pub fn decided_allow_builds(allow_builds: HashMap<String, AllowBuild>) -> HashMa
 /// (or the hard-coded default).
 ///
 /// See <https://pnpm.io/settings> for the canonical key list.
-/// Non-config keys in a real pnpm-workspace.yaml (`packages`, `catalog`,
-/// `catalogs`, `onlyBuiltDependencies`, `allowBuilds`, ...) are silently
-/// ignored — serde drops them since the struct doesn't use
+/// Workspace-structural keys (`packages`, `catalog`, `catalogs`, the build
+/// allowlists) are carried only for `pnpm config get` / `list` — see
+/// [`Self::packages`]. Anything else that is not a field is silently
+/// ignored — serde drops it since the struct doesn't use
 /// `deny_unknown_fields`.
 ///
 /// pnpm v11 also reads `patchedDependencies` (and the other install
@@ -356,6 +360,23 @@ pub struct WorkspaceSettings {
     /// `pnpm-workspace.yaml` alongside other install settings.
     pub allow_builds: Option<HashMap<String, AllowBuild>>,
 
+    /// The workspace-structural keys of `pnpm-workspace.yaml`, carried so
+    /// `pnpm config get` / `pnpm config list` can show them. Installs read
+    /// them from the workspace-manifest layer, not from [`Config`], so
+    /// [`Self::apply_to`] leaves them alone and the global `config.yaml`
+    /// refuses them.
+    pub packages: Option<Vec<String>>,
+    /// See [`Self::packages`].
+    pub catalog: Option<IndexMap<String, String>>,
+    /// See [`Self::packages`].
+    pub catalogs: Option<IndexMap<String, IndexMap<String, String>>>,
+    /// See [`Self::packages`].
+    pub only_built_dependencies: Option<Vec<String>>,
+    /// See [`Self::packages`].
+    pub never_built_dependencies: Option<Vec<String>>,
+    /// See [`Self::packages`].
+    pub ignored_built_dependencies: Option<Vec<String>>,
+
     /// Bypass the [`allow_builds`] gate entirely — every package may
     /// run lifecycle scripts. Same `pnpm-workspace.yaml` migration
     /// as `allowBuilds`. Default `false`.
@@ -540,6 +561,17 @@ pub struct WorkspaceSettings {
 
     /// `trustPolicy` from `pnpm-workspace.yaml`. See [`TrustPolicy`].
     pub trust_policy: Option<TrustPolicy>,
+
+    /// `initPackageManager` from `pnpm-workspace.yaml` /
+    /// `~/.config/pnpm/config.yaml`. See
+    /// [`Config::init_package_manager`].
+    ///
+    /// [`Config::init_package_manager`]: crate::Config::init_package_manager
+    pub init_package_manager: Option<bool>,
+
+    /// `initType` from `pnpm-workspace.yaml` /
+    /// `~/.config/pnpm/config.yaml`. See [`InitType`].
+    pub init_type: Option<InitType>,
 
     /// `pmOnFail` from `pnpm-workspace.yaml`. See [`PmOnFail`].
     pub pm_on_fail: Option<PmOnFail>,
@@ -934,9 +966,10 @@ impl WorkspaceSettings {
         };
         let mut settings: WorkspaceSettings = serde_saphyr::from_str(&text)
             .map_err(Box::new)
-            .map_err(|source| LoadWorkspaceYamlError::ParseYaml { path, source })?;
+            .map_err(|source| LoadWorkspaceYamlError::ParseYaml { path: path.clone(), source })?;
         settings.validate_registries()?;
         settings.clear_workspace_only_fields();
+        settings.warn_about_dropped_keys(&text, &path);
         Ok(Some(settings))
     }
 
@@ -950,6 +983,71 @@ impl WorkspaceSettings {
     fn validate_registries(&self) -> Result<(), LoadWorkspaceYamlError> {
         let Some(entries) = self.registries.as_ref() else { return Ok(()) };
         registries::validate(entries)
+    }
+
+    /// Warn about the keys of the global `config.yaml` that never reach the
+    /// settings, in the three messages pnpm emits for that file.
+    ///
+    /// What survived is read back off `self` rather than off a second list of
+    /// key names, which would drift from the struct: a key serde did not
+    /// recognize is absent from the serialized settings, and one
+    /// [`Self::clear_workspace_only_fields`] zeroed is null there.
+    ///
+    /// A dropped camelCase key pnpm's `isConfigFileKey` accepts stays silent:
+    /// pnpm honors it in this file, so the fix is to honor it too, and until
+    /// then a warning would diverge from pnpm's output on the same file.
+    fn warn_about_dropped_keys(&self, text: &str, path: &Path) {
+        let Ok(document) = serde_saphyr::from_str::<IndexMap<String, Option<IgnoredAny>>>(text)
+        else {
+            return;
+        };
+        let Ok(serde_json::Value::Object(kept)) = serde_json::to_value(self) else {
+            return;
+        };
+
+        let mut movable = Vec::new();
+        let mut nowhere = Vec::new();
+        let mut kebab_case = Vec::new();
+        for key in document.iter().filter(|(_, value)| value.is_some()).map(|(key, _)| key) {
+            if matches!(kept.get(key), Some(value) if !value.is_null()) {
+                continue;
+            }
+            if !is_config_file_key(&to_kebab_case(key)) {
+                if is_refused_by_a_project_manifest(key) {
+                    nowhere.push(format!(
+                        r#""{key}" ({})"#,
+                        where_refused_key_belongs(&to_camel_case(key)),
+                    ));
+                } else {
+                    movable.push(format!(r#""{key}""#));
+                }
+            } else if !is_camel_case(key) {
+                kebab_case.push(format!(r#""{key}" (use "{}")"#, to_camel_case(key)));
+            }
+        }
+
+        let path = path.display();
+        if !movable.is_empty() {
+            let movable = movable.join(", ");
+            tracing::warn!(
+                target: "pacquet::config",
+                r#"The following settings cannot be set in the global config file ("{path}") and were ignored: {movable}. Move them to a project-level pnpm-workspace.yaml. To share these settings across projects, use config dependencies: https://pnpm.io/11.x/config-dependencies"#,
+            );
+        }
+        if !nowhere.is_empty() {
+            let nowhere = nowhere.join(", ");
+            tracing::warn!(
+                target: "pacquet::config",
+                r#"The following settings cannot be set in the global config file ("{path}") and were ignored: {nowhere}."#,
+            );
+        }
+        if !kebab_case.is_empty() {
+            let kebab_case = kebab_case.join(", ");
+            tracing::warn!(
+                target: "pacquet::config",
+                r#"The following settings in the global config file ("{path}") were ignored because they are not written in camelCase: {kebab_case}."#,
+            );
+        }
     }
 
     /// Zero out the release-age and trust policies for `self-update`.
@@ -998,6 +1096,12 @@ impl WorkspaceSettings {
             }
         }
         self.versioning = None;
+        self.packages = None;
+        self.catalog = None;
+        self.catalogs = None;
+        self.only_built_dependencies = None;
+        self.never_built_dependencies = None;
+        self.ignored_built_dependencies = None;
         self.hoist = None;
         self.hoist_pattern = None;
         self.public_hoist_pattern = None;
@@ -1198,6 +1302,8 @@ impl WorkspaceSettings {
             auto_install_peers, auto_install_peers_from_highest_match,
             exclude_links_from_lockfile,
             optimistic_repeat_install,
+            init_package_manager,
+            init_type,
             hoist_workspace_packages,
             extend_node_path,
             hoisting_limits, external_dependencies,

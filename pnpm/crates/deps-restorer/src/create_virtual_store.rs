@@ -21,7 +21,10 @@ use pnpm_package_manifest::{
 use pnpm_reporter::{
     LogEvent, LogLevel, ProgressLog, ProgressMessage, Reporter, StatsLog, StatsMessage,
 };
-use pnpm_store_dir::{SharedVerifiedFilesCache, StoreIndex, StoreIndexWriter, store_index_key};
+use pnpm_store_dir::{
+    SharedReadonlyStoreIndex, SharedVerifiedFilesCache, StoreIndex, StoreIndexWriter,
+    store_index_key,
+};
 use pnpm_tarball::{MemCache, SharedReportedProgressKeys, prefetch_cas_paths};
 use std::{
     collections::{HashMap, HashSet},
@@ -72,6 +75,12 @@ pub type SideEffectsMapsBySnapshot =
 /// avoid re-inspecting every package directory after materialization.
 pub type RequiresBuildBySnapshot = HashMap<PackageKey, bool>;
 
+/// Store handles that a fresh resolution and dependency materialization share.
+pub struct CreateVirtualStoreStoreContext<'a> {
+    pub index: Option<&'a SharedReadonlyStoreIndex>,
+    pub verified_files_cache: &'a SharedVerifiedFilesCache,
+}
+
 /// A snapshot paired with the store-index cache key it is looked up
 /// by. `None` for a resolution that never goes through the CAFS
 /// (directory and git), which therefore has no row to prefetch.
@@ -92,6 +101,11 @@ pub struct CreateVirtualStoreOutput {
     pub package_manifests: PackageManifests,
     pub side_effects_maps_by_snapshot: SideEffectsMapsBySnapshot,
     pub requires_build_by_snapshot: RequiresBuildBySnapshot,
+    /// Snapshot keys whose package directories this run materialized.
+    /// The build phase uses this list to record only newly deferred
+    /// builds under `ignoreScripts`; earlier debt is retained from
+    /// `.modules.yaml` by the install orchestrator.
+    pub materialized_snapshots: Vec<PackageKey>,
     pub fetch_failed: HashSet<PackageKey>,
     /// Per-package CAS index, populated only when
     /// [`CreateVirtualStore::node_linker`] is
@@ -135,6 +149,7 @@ pub struct CreateVirtualStore<'a> {
     /// download path's `InstallPackageBySnapshot` and also reused by
     /// `BuildModules` for the side-effects-cache WRITE path.
     pub store_index_writer: &'a std::sync::Arc<StoreIndexWriter>,
+    pub store_context: Option<CreateVirtualStoreStoreContext<'a>>,
     /// `allowBuilds` gate, shared with `BuildModules`. The cold-batch
     /// path threads this into the git fetcher so `preparePackage` can
     /// reject `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED` for packages that aren't
@@ -252,6 +267,7 @@ impl CreateVirtualStore<'_> {
             logged_methods,
             requester,
             store_index_writer,
+            store_context,
             allow_build_policy,
             skipped,
             include_optional_dependencies,
@@ -277,6 +293,7 @@ impl CreateVirtualStore<'_> {
                 package_manifests: PackageManifests::new(),
                 side_effects_maps_by_snapshot: SideEffectsMapsBySnapshot::new(),
                 requires_build_by_snapshot: RequiresBuildBySnapshot::new(),
+                materialized_snapshots: Vec::new(),
                 fetch_failed: HashSet::new(),
                 cas_paths_by_pkg_id: is_hoisted.then(CasPathsByPkgId::new),
             });
@@ -313,7 +330,7 @@ impl CreateVirtualStore<'_> {
         // policy shared with `install_without_lockfile.rs`. Skipped under
         // `frozenStore`: the store is read-only and complete, so no
         // directory creation is attempted under its root.
-        if !config.frozen_store {
+        if store_context.is_none() && !config.frozen_store {
             init_store_dir_best_effort(store_dir).await;
         }
 
@@ -329,7 +346,10 @@ impl CreateVirtualStore<'_> {
                 None
             };
 
-        let store_index = StoreIndex::open_shared(store_dir, config.frozen_store).await;
+        let store_index = match store_context.as_ref().and_then(|context| context.index) {
+            Some(index) => Some(Arc::clone(index)),
+            None => StoreIndex::open_shared(store_dir, config.frozen_store).await,
+        };
         let store_index_ref = store_index.as_ref();
 
         // The batched store-index writer is owned by the caller
@@ -347,7 +367,10 @@ impl CreateVirtualStore<'_> {
         // gets the same handle. A CAFS path verified on snapshot A
         // populates the set so snapshot B's verify pass skips the stat
         // / re-hash cost.
-        let verified_files_cache = SharedVerifiedFilesCache::default();
+        let verified_files_cache = store_context
+            .map_or_else(SharedVerifiedFilesCache::default, |context| {
+                Arc::clone(context.verified_files_cache)
+            });
 
         // Batch every cache lookup the per-snapshot futures would otherwise
         // each fan into `tokio::task::spawn_blocking`. With 1352 snapshots
@@ -400,6 +423,8 @@ impl CreateVirtualStore<'_> {
             ignore_scripts: config.ignore_scripts,
             runtime_platform_selector: &runtime_platform_selector,
         })?;
+        let materialized_snapshots =
+            snapshot_entries.iter().map(|(snapshot_key, _, _)| (*snapshot_key).clone()).collect();
 
         // `pnpm:stats added` fires one event per project once the
         // orchestrator has decided how many packages will land in the
@@ -818,6 +843,7 @@ impl CreateVirtualStore<'_> {
             package_manifests,
             side_effects_maps_by_snapshot,
             requires_build_by_snapshot,
+            materialized_snapshots,
             fetch_failed,
             cas_paths_by_pkg_id,
         })

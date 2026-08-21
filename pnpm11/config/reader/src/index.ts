@@ -58,7 +58,7 @@ export { types }
 export { getDefaultWorkspaceConcurrency, getWorkspaceConcurrency } from './concurrency.js'
 export { getGlobalConfigPath } from './dirs.js'
 export { getDefaultCreds, getNetworkConfigs, type NetworkConfigs } from './getNetworkConfigs.js'
-export { getOptionsFromPnpmSettings, type OptionsFromRootManifest } from './getOptionsFromRootManifest.js'
+export { getOptionsFromPnpmSettings, type OptionsFromRootManifest, toAuditSettings, toUpdateSettings } from './getOptionsFromRootManifest.js'
 export {
   getPackageManagerBootstrapConfig,
   getPackageManagerRegistries,
@@ -567,11 +567,11 @@ export async function getConfig (opts: {
     pnpmConfig.registry = pnpmConfig.registriesByScope.default
   }
 
-  // omit some schema that the custom parser can't yet handle
   const envPnpmTypes = omit([
-    'init-version', // the type is a private function named 'semver'
-    'node-version', // the type is a private function named 'semver'
-    'umask', // the type is a private function named 'Umask'
+    // Keep pnpm and pacquet's init behavior aligned until pacquet reads init config.
+    'init-version',
+    // npm interprets leading-zero values as octal, while the Number schema does not.
+    'umask',
   ], types)
 
   let virtualStoreTypeFromEnv: VirtualStoreType | undefined
@@ -684,6 +684,10 @@ export async function getConfig (opts: {
     pnpmConfig.filterProd = (pnpmConfig.filterProd as string).split(' ')
   }
 
+  if (pnpmConfig.sharedWorkspaceLockfile && !pnpmConfig.lockfileDir && pnpmConfig.workspaceDir) {
+    pnpmConfig.lockfileDir = pnpmConfig.workspaceDir
+  }
+
   if (pnpmConfig.workspaceDir) {
     pnpmConfig.extraBinPaths = [path.join(pnpmConfig.workspaceDir, 'node_modules', '.bin')]
   } else {
@@ -763,10 +767,6 @@ export async function getConfig (opts: {
   }
   pnpmConfig.sideEffectsCacheRead = pnpmConfig.sideEffectsCache ?? pnpmConfig.sideEffectsCacheReadonly
   pnpmConfig.sideEffectsCacheWrite = pnpmConfig.sideEffectsCache
-
-  if (pnpmConfig.sharedWorkspaceLockfile && !pnpmConfig.lockfileDir && pnpmConfig.workspaceDir) {
-    pnpmConfig.lockfileDir = pnpmConfig.workspaceDir
-  }
 
   pnpmConfig.workspaceConcurrency = getWorkspaceConcurrency(pnpmConfig.workspaceConcurrency)
 

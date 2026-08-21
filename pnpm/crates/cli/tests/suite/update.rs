@@ -14,6 +14,7 @@ use tempfile::TempDir;
 
 const DEP: &str = "@pnpm.e2e/dep-of-pkg-with-1-dep";
 const FOO: &str = "@pnpm.e2e/foo";
+const HAS_PRERELEASE: &str = "@pnpm.e2e/has-prerelease";
 /// Depends on `dep-of-pkg-with-1-dep@^100.0.0`, used to exercise
 /// indirect-dependency update behavior when the direct dep is ignored.
 const PARENT: &str = "@pnpm.e2e/pkg-with-1-dep";
@@ -172,6 +173,32 @@ fn update_preserves_the_declared_range_operator() {
     assert_eq!(dep_spec(&workspace, "@pnpm.e2e/bravo-dep").as_deref(), Some("~1.0.1"));
     assert_eq!(dep_spec(&workspace, FOO).as_deref(), Some("1.0.0"));
     assert_eq!(dep_spec(&workspace, PARENT).as_deref(), Some("^100.1.0"));
+
+    drop((root, anchor));
+}
+
+#[test]
+fn update_preserves_an_existing_prerelease_range_operator() {
+    let (root, workspace, anchor) = setup();
+
+    write_manifest(&workspace, &format!(r#"{{ "{HAS_PRERELEASE}": "3.0.0-rc.0" }}"#));
+    pacquet(&workspace, ["install"]).assert().success();
+    assert!(
+        virtual_store_has(&workspace, "@pnpm.e2e+has-prerelease@3.0.0-rc.0"),
+        "virtual store entries: {:?}",
+        list_virtual_store(&workspace),
+    );
+
+    write_manifest(&workspace, &format!(r#"{{ "{HAS_PRERELEASE}": "^3.0.0-rc.0" }}"#));
+    pacquet(&workspace, ["update"]).assert().success();
+
+    assert!(
+        virtual_store_has(&workspace, "@pnpm.e2e+has-prerelease@3.0.0-rc.1"),
+        "virtual store entries: {:?}",
+        list_virtual_store(&workspace),
+    );
+    assert_eq!(dep_spec(&workspace, HAS_PRERELEASE).as_deref(), Some("^3.0.0-rc.1"));
+    pacquet(&workspace, ["install", "--frozen-lockfile"]).assert().success();
 
     drop((root, anchor));
 }
@@ -1081,6 +1108,35 @@ fn update_latest_no_save_catalog_bumps_lockfile_only() {
     drop((root, anchor));
 }
 
+/// A versioned `npm:` selector targets the package the alias installs, not
+/// the alias it is written at: update targets are keyed by the resolved
+/// package name, so keying them by the alias leaves the pin in place.
+#[test]
+fn update_npm_alias_selector_targets_the_aliased_package() {
+    let (root, workspace, anchor) = setup();
+
+    // Pin the aliased package at 100.0.0 through a direct exact entry,
+    // then drop the entry so the alias is the only thing holding it — its
+    // ^100.0.0 range a fresh resolve answers with 100.1.0.
+    write_manifest(
+        &workspace,
+        &format!(r#"{{ "dep-alias": "npm:{DEP}@^100.0.0", "{DEP}": "100.0.0" }}"#),
+    );
+    pacquet(&workspace, ["install"]).assert().success();
+    assert!(virtual_store_has(&workspace, "@pnpm.e2e+dep-of-pkg-with-1-dep@100.0.0"));
+    write_manifest(&workspace, &format!(r#"{{ "dep-alias": "npm:{DEP}@^100.0.0" }}"#));
+
+    pacquet(&workspace, ["update", &format!("dep-alias@npm:{DEP}@^100.0.0")]).assert().success();
+
+    eprintln!("virtual store contents: {:?}", list_virtual_store(&workspace));
+    assert!(
+        virtual_store_has(&workspace, "@pnpm.e2e+dep-of-pkg-with-1-dep@100.1.0"),
+        "the selector should have withheld the aliased package's pin",
+    );
+
+    drop((root, anchor));
+}
+
 /// The alias name does not exist in the mock registry.
 #[test]
 fn update_latest_npm_alias_resolves_aliased_package() {
@@ -1469,6 +1525,166 @@ fn update_no_save_skips_version_outside_kept_range() {
         "the out-of-range requested version must not be recorded",
     );
     // The lockfile still satisfies the manifest.
+    pacquet(&workspace, ["install", "--frozen-lockfile"]).assert().success();
+
+    drop((root, anchor));
+}
+
+#[test]
+fn update_no_save_keeps_importer_specifier_for_admitted_version() {
+    let (root, workspace, anchor) = setup();
+
+    write_manifest(&workspace, &format!(r#"{{ "{DEP}": "100.0.0" }}"#));
+    pacquet(&workspace, ["install"]).assert().success();
+    write_manifest(&workspace, &format!(r#"{{ "{DEP}": "^100.0.0" }}"#));
+
+    let output =
+        pacquet(&workspace, ["update", "--no-save", "--lockfile-only", &format!("{DEP}@100.1.0")])
+            .output()
+            .expect("run update --no-save");
+    assert!(output.status.success(), "update --no-save failed: {output:?}");
+
+    assert_eq!(dep_spec(&workspace, DEP).as_deref(), Some("^100.0.0"));
+    let lock = fs::read_to_string(workspace.join("pnpm-lock.yaml")).expect("read pnpm-lock.yaml");
+    assert!(lock.contains("version: 100.1.0"), "the requested admitted version must be resolved");
+    assert!(
+        lock.contains("specifier: ^100.0.0"),
+        "the lockfile importer entry must keep the manifest's specifier: {lock}",
+    );
+    assert!(
+        !lock.contains("specifier: 100.1.0"),
+        "the requested version must not replace the importer specifier: {lock}",
+    );
+    pacquet(&workspace, ["install", "--frozen-lockfile"]).assert().success();
+
+    drop((root, anchor));
+}
+
+#[test]
+fn update_no_save_applies_read_package_to_kept_importer_specifier() {
+    let (root, workspace, anchor) = setup();
+
+    write_manifest(&workspace, &format!(r#"{{ "{DEP}": "100.0.0" }}"#));
+    pacquet(&workspace, ["install"]).assert().success();
+    write_manifest(&workspace, &format!(r#"{{ "{DEP}": "^100.0.0" }}"#));
+    fs::write(
+        workspace.join(".pnpmfile.cjs"),
+        format!(
+            "module.exports = {{ hooks: {{ readPackage (pkg) {{\n  if (pkg.name === 'test-update' && pkg.dependencies && pkg.dependencies[{DEP:?}]) {{\n    pkg.dependencies[{DEP:?}] = '100.1.0';\n  }}\n  return pkg;\n}} }} }}\n",
+        ),
+    )
+    .expect("write pnpmfile");
+
+    let output =
+        pacquet(&workspace, ["update", "--no-save", "--lockfile-only", &format!("{DEP}@100.1.0")])
+            .output()
+            .expect("run update --no-save");
+    assert!(output.status.success(), "update --no-save failed: {output:?}");
+
+    assert_eq!(dep_spec(&workspace, DEP).as_deref(), Some("^100.0.0"));
+    let lock = fs::read_to_string(workspace.join("pnpm-lock.yaml")).expect("read pnpm-lock.yaml");
+    assert!(
+        lock.contains("specifier: 100.1.0"),
+        "the lockfile importer entry must follow readPackage's kept specifier: {lock}",
+    );
+    assert!(
+        !lock.contains("specifier: ^100.0.0"),
+        "the raw package.json specifier must not bypass readPackage: {lock}",
+    );
+    pacquet(&workspace, ["install", "--frozen-lockfile"]).assert().success();
+
+    drop((root, anchor));
+}
+
+#[test]
+fn update_no_save_runs_read_package_once_for_kept_importer_specifier() {
+    let (root, workspace, anchor) = setup();
+
+    write_manifest(&workspace, &format!(r#"{{ "{DEP}": "100.0.0" }}"#));
+    pacquet(&workspace, ["install"]).assert().success();
+    write_manifest(&workspace, &format!(r#"{{ "{DEP}": "^100.0.0" }}"#));
+    fs::write(
+        workspace.join(".pnpmfile.cjs"),
+        format!(
+            "const fs = require('fs');\nconst path = require('path');\nmodule.exports = {{ hooks: {{ readPackage (pkg) {{\n  if (pkg.name === 'test-update') {{\n    fs.appendFileSync(path.join(__dirname, 'read-package.log'), `${{pkg.dependencies && pkg.dependencies[{DEP:?}]}}\\n`);\n  }}\n  if (pkg.name === 'test-update' && pkg.dependencies && pkg.dependencies[{DEP:?}]) {{\n    pkg.dependencies[{DEP:?}] = '100.1.0';\n  }}\n  return pkg;\n}} }} }}\n",
+        ),
+    )
+    .expect("write pnpmfile");
+
+    let output =
+        pacquet(&workspace, ["update", "--no-save", "--lockfile-only", &format!("{DEP}@100.1.0")])
+            .output()
+            .expect("run update --no-save");
+    assert!(output.status.success(), "update --no-save failed: {output:?}");
+
+    assert_eq!(dep_spec(&workspace, DEP).as_deref(), Some("^100.0.0"));
+    let hook_log =
+        fs::read_to_string(workspace.join("read-package.log")).expect("read readPackage log");
+    let root_hook_inputs = hook_log.lines().collect::<Vec<_>>();
+    assert_eq!(
+        root_hook_inputs,
+        vec!["^100.0.0"],
+        "readPackage should see the kept importer manifest exactly once",
+    );
+    let lock = fs::read_to_string(workspace.join("pnpm-lock.yaml")).expect("read pnpm-lock.yaml");
+    assert!(
+        lock.contains("specifier: 100.1.0"),
+        "the lockfile importer entry must use the transformed kept specifier: {lock}",
+    );
+
+    drop((root, anchor));
+}
+
+/// A root `update --no-save` in a workspace pre-hooks only the root manifest,
+/// so the install layer must still run `readPackage` over the workspace
+/// projects it discovers itself — exactly once each. Regression test for the
+/// review finding on <https://github.com/pnpm/pnpm/pull/13812>.
+#[test]
+fn update_no_save_applies_read_package_to_workspace_projects() {
+    let (root, workspace, anchor) = setup();
+
+    let workspace_yaml_path = workspace.join("pnpm-workspace.yaml");
+    let mut workspace_yaml =
+        fs::read_to_string(&workspace_yaml_path).expect("read pnpm-workspace.yaml");
+    workspace_yaml.push_str("packages:\n  - 'packages/*'\n");
+    fs::write(&workspace_yaml_path, workspace_yaml).expect("write pnpm-workspace.yaml");
+    write_manifest(&workspace, &format!(r#"{{ "{DEP}": "100.0.0" }}"#));
+    fs::create_dir_all(workspace.join("packages/a")).expect("mkdir packages/a");
+    fs::write(
+        workspace.join("packages/a/package.json"),
+        format!(r#"{{ "name": "@test/a", "version": "1.0.0", "dependencies": {{ "{DEP}": "100.0.0" }} }}"#),
+    )
+    .expect("write packages/a/package.json");
+    pacquet(&workspace, ["install"]).assert().success();
+    write_manifest(&workspace, &format!(r#"{{ "{DEP}": "^100.0.0" }}"#));
+    fs::write(
+        workspace.join(".pnpmfile.cjs"),
+        format!(
+            "const fs = require('fs');\nconst path = require('path');\nmodule.exports = {{ hooks: {{ readPackage (pkg) {{\n  if (pkg.name === 'test-update' || pkg.name === '@test/a') {{\n    fs.appendFileSync(path.join(__dirname, 'read-package.log'), `${{pkg.name}}:${{pkg.dependencies && pkg.dependencies[{DEP:?}]}}\\n`);\n  }}\n  if (pkg.name === '@test/a' && pkg.dependencies && pkg.dependencies[{DEP:?}]) {{\n    pkg.dependencies[{DEP:?}] = '100.1.0';\n  }}\n  return pkg;\n}} }} }}\n",
+        ),
+    )
+    .expect("write pnpmfile");
+
+    let output =
+        pacquet(&workspace, ["update", "--no-save", "--lockfile-only", &format!("{DEP}@100.1.0")])
+            .output()
+            .expect("run update --no-save");
+    assert!(output.status.success(), "update --no-save failed: {output:?}");
+
+    let hook_log =
+        fs::read_to_string(workspace.join("read-package.log")).expect("read readPackage log");
+    let mut hook_inputs = hook_log.lines().collect::<Vec<_>>();
+    hook_inputs.sort_unstable();
+    assert_eq!(
+        hook_inputs,
+        vec!["@test/a:100.0.0", "test-update:^100.0.0"],
+        "readPackage should see each project manifest exactly once",
+    );
+    let lock = fs::read_to_string(workspace.join("pnpm-lock.yaml")).expect("read pnpm-lock.yaml");
+    assert!(
+        lock.contains("specifier: 100.1.0"),
+        "the workspace project's importer entry must follow readPackage's rewrite: {lock}",
+    );
     pacquet(&workspace, ["install", "--frozen-lockfile"]).assert().success();
 
     drop((root, anchor));

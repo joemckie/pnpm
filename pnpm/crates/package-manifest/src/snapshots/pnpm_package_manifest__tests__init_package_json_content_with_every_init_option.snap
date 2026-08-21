@@ -1,0 +1,25 @@
+---
+source: pnpm/crates/package-manifest/src/tests.rs
+expression: "serde_json::to_string_pretty(&manifest).unwrap()"
+---
+{
+  "name": "test",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm",
+      "version": "11.22.0",
+      "onFail": "download"
+    }
+  },
+  "packageManager": "pnpm@11.22.0",
+  "type": "module"
+}

@@ -1,6 +1,7 @@
 use super::{
     Config, EnvVar, EnvVarOs, GetCurrentDir, GetHomeDir, Host, LinkProbe, LoadWorkspaceYamlError,
-    NodeLinker, NodePackageMapType, PackageImportMethod, TrustPolicy, default_ci, fs,
+    NodeLinker, NodePackageMapType, PackageImportMethod, TrustPolicy, WorkspaceSettings,
+    default_ci, fs,
 };
 use crate::defaults::default_store_dir;
 use pnpm_store_dir::StoreDir;
@@ -2149,6 +2150,25 @@ pub fn explicit_settings_report_the_spelling_that_won() {
     }
 }
 
+/// `audit.level` supersedes the deprecated `auditLevel` spelling, and
+/// `pnpm config get audit-level` reads the explicit-settings record — so the
+/// record has to carry the level under the deprecated name too, whichever
+/// spelling the file was written in.
+#[test]
+pub fn explicit_settings_mirror_audit_level_from_the_audit_section() {
+    for yaml in ["audit:\n  level: high\n", "audit:\n  level: high\nauditLevel: low\n"] {
+        let tmp = tempdir().unwrap();
+        fs::write(tmp.path().join("pnpm-workspace.yaml"), yaml)
+            .expect("write to pnpm-workspace.yaml");
+        let config = Config::new().current::<HostNoHome>(tmp.path()).expect("yaml is valid");
+        assert_eq!(
+            config.explicit_settings.get("auditLevel").and_then(serde_json::Value::as_str),
+            Some("high"),
+            "yaml: {yaml}",
+        );
+    }
+}
+
 #[test]
 pub fn gvs_disabled_keeps_project_local_virtual_store() {
     let tmp = tempdir().unwrap();
@@ -3043,6 +3063,19 @@ pub fn engine_strict_node_version_and_max_sockets_from_workspace_yaml() {
 }
 
 #[test]
+pub fn node_version_from_pnpm_config_env_overrides_workspace_yaml() {
+    fake_env!(load_with_fake_env);
+    let tmp = tempdir().unwrap();
+    fs::write(tmp.path().join("pnpm-workspace.yaml"), "nodeVersion: 18.20.4\n")
+        .expect("write to pnpm-workspace.yaml");
+
+    set_fake_env(&[("PNPM_CONFIG_NODE_VERSION", "20.0.0")]);
+    let config = load_with_fake_env(tmp.path());
+
+    assert_eq!(config.node_version.as_deref(), Some("20.0.0"));
+}
+
+#[test]
 pub fn catalog_prune_from_workspace_yaml() {
     let tmp = tempdir().unwrap();
     let config = Config::new().current::<HostNoHome>(tmp.path()).expect("loads");
@@ -3481,4 +3514,134 @@ pub fn extra_bin_paths_lists_workspace_root_bin_only_inside_a_workspace() {
         .expect("write pnpm-workspace.yaml");
     let config = load_with_fake_env(project.path());
     assert_eq!(config.extra_bin_paths, vec![project.path().join("node_modules").join(".bin")]);
+}
+
+/// A key spelled in kebab-case in the global `config.yaml` is read by
+/// nothing, since only camelCase reaches the settings, so it is reported
+/// naming the spelling that works.
+#[test]
+pub fn global_config_yaml_kebab_case_key_is_reported() {
+    let config_dir = tempdir().expect("config tempdir");
+    let config_file = config_dir.path().join("config.yaml");
+    fs::write(&config_file, "store-dir: /kebab-store\nstoreDir: /camel-store\n")
+        .expect("write global config.yaml");
+
+    let warnings = capture_warnings(|| {
+        let settings = WorkspaceSettings::load_global(config_dir.path())
+            .expect("load global config.yaml")
+            .expect("global config.yaml is present");
+        assert_eq!(settings.store_dir.as_deref(), Some("/camel-store"));
+    });
+
+    assert_eq!(
+        warnings,
+        [format!(
+            r#"The following settings in the global config file ("{}") were ignored because they are not written in camelCase: "store-dir" (use "storeDir")."#,
+            config_file.display(),
+        )],
+    );
+}
+
+/// A workspace-only setting and a key that is no setting at all are both
+/// dropped from the global `config.yaml`, so both are reported.
+#[test]
+pub fn global_config_yaml_keys_it_cannot_set_are_reported() {
+    let config_dir = tempdir().expect("config tempdir");
+    let config_file = config_dir.path().join("config.yaml");
+    fs::write(&config_file, "nodeLinker: hoisted\npackages:\n  - lib/*\n")
+        .expect("write global config.yaml");
+
+    let warnings = capture_warnings(|| {
+        let settings = WorkspaceSettings::load_global(config_dir.path())
+            .expect("load global config.yaml")
+            .expect("global config.yaml is present");
+        assert_eq!(settings.node_linker, None);
+    });
+
+    assert_eq!(
+        warnings,
+        [format!(
+            r#"The following settings cannot be set in the global config file ("{}") and were ignored: "nodeLinker", "packages". Move them to a project-level pnpm-workspace.yaml. To share these settings across projects, use config dependencies: https://pnpm.io/11.x/config-dependencies"#,
+            config_file.display(),
+        )],
+    );
+}
+
+/// A key no configuration file may set is reported with the route pnpm
+/// offers for it, not with the move-to-workspace advice.
+#[test]
+pub fn global_config_yaml_keys_settable_nowhere_are_reported_with_their_route() {
+    let config_dir = tempdir().expect("config tempdir");
+    let config_file = config_dir.path().join("config.yaml");
+    fs::write(&config_file, "configDir: /elsewhere\nbin: /usr/local/bin\ndir: /work\n")
+        .expect("write global config.yaml");
+
+    let warnings = capture_warnings(|| {
+        WorkspaceSettings::load_global(config_dir.path())
+            .expect("load global config.yaml")
+            .expect("global config.yaml is present");
+    });
+
+    assert_eq!(
+        warnings,
+        [format!(
+            r#"The following settings cannot be set in the global config file ("{}") and were ignored: "configDir" (This is not a pnpm setting), "bin" (Set it for the machine instead: pnpm config set --global global-bin-dir), "dir" (Pass --dir on the command line instead)."#,
+            config_file.display(),
+        )],
+    );
+}
+
+/// A dropped key pnpm honors in this file gets no warning; the rationale
+/// lives on `warn_about_dropped_keys`.
+#[test]
+pub fn global_config_yaml_key_pnpm_honors_stays_silent() {
+    let config_dir = tempdir().expect("config tempdir");
+    let config_file = config_dir.path().join("config.yaml");
+    fs::write(&config_file, "globalBinDir: /usr/local/pnpm-bin\n")
+        .expect("write global config.yaml");
+
+    let warnings = capture_warnings(|| {
+        WorkspaceSettings::load_global(config_dir.path())
+            .expect("load global config.yaml")
+            .expect("global config.yaml is present");
+    });
+
+    assert_eq!(warnings, Vec::<String>::new());
+}
+
+/// An explicit null sets nothing, so it is not reported. A file carrying
+/// every kind of dropped key gets all three warnings, in pnpm's order.
+#[test]
+pub fn global_config_yaml_null_key_is_silent_and_the_warnings_are_ordered() {
+    let config_dir = tempdir().expect("config tempdir");
+    let config_file = config_dir.path().join("config.yaml");
+    fs::write(
+        &config_file,
+        "scriptShell: null\nstore-dir: /kebab-store\nconfigDir: /elsewhere\nnodeLinker: hoisted\n",
+    )
+    .expect("write global config.yaml");
+
+    let warnings = capture_warnings(|| {
+        WorkspaceSettings::load_global(config_dir.path())
+            .expect("load global config.yaml")
+            .expect("global config.yaml is present");
+    });
+
+    assert_eq!(
+        warnings,
+        [
+            format!(
+                r#"The following settings cannot be set in the global config file ("{}") and were ignored: "nodeLinker". Move them to a project-level pnpm-workspace.yaml. To share these settings across projects, use config dependencies: https://pnpm.io/11.x/config-dependencies"#,
+                config_file.display(),
+            ),
+            format!(
+                r#"The following settings cannot be set in the global config file ("{}") and were ignored: "configDir" (This is not a pnpm setting)."#,
+                config_file.display(),
+            ),
+            format!(
+                r#"The following settings in the global config file ("{}") were ignored because they are not written in camelCase: "store-dir" (use "storeDir")."#,
+                config_file.display(),
+            ),
+        ],
+    );
 }

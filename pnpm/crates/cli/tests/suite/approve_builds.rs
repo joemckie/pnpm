@@ -358,6 +358,29 @@ fn install_two_with_ignored_builds() -> (CommandTempCwd<AddMockedRegistry>, std:
     (harness, workspace)
 }
 
+#[test]
+fn approve_builds_works_after_removing_an_unrelated_dependency() {
+    let (harness, workspace) = install_two_with_ignored_builds();
+
+    pacquet(&workspace).with_args(["remove", INSTALL]).assert().success();
+
+    let output = stdout_of(pacquet(&workspace).with_arg("ignored-builds").assert());
+    assert!(output.contains(PREPOST), "the remaining package stays pending: {output}");
+    assert!(!output.contains(INSTALL), "the removed package must not stay pending: {output}");
+
+    pacquet(&workspace).with_args(["approve-builds", "--all"]).assert().success();
+
+    assert!(workspace.join(PREPOST_MARKER).exists(), "remaining package built under --all");
+    assert!(!workspace.join(INSTALL_MARKER).exists(), "removed package was not rebuilt");
+    assert_eq!(
+        allow_builds(&workspace).get(PREPOST),
+        Some(&true),
+        "remaining package approval persisted",
+    );
+
+    drop(harness);
+}
+
 /// The `allowBuilds` map recorded in the workspace manifest.
 /// The *decided* `allowBuilds` entries. An install scaffolds an
 /// undecided placeholder for every build it blocked, which is a prompt to
@@ -473,6 +496,36 @@ fn approve_builds_preserves_existing_allow_builds_entries() {
     assert_eq!(builds.get("@pnpm.e2e/existing-package"), Some(&true), "existing entry kept");
     assert_eq!(builds.get(PREPOST), Some(&true), "approved package recorded");
     assert!(!builds.contains_key(INSTALL), "unmentioned package not touched: {builds:?}");
+
+    drop(harness);
+}
+
+#[test]
+fn approve_builds_clears_legacy_build_settings() {
+    let (harness, workspace) = install_two_with_ignored_builds();
+
+    let yaml_path = workspace.join("pnpm-workspace.yaml");
+    let mut yaml = fs::read_to_string(&yaml_path).expect("read pnpm-workspace.yaml");
+    yaml.push_str(concat!(
+        "onlyBuiltDependencies:\n  - esbuild\n",
+        "onlyBuiltDependenciesFile: allowed.json\n",
+        "neverBuiltDependencies:\n  - fsevents\n",
+        "ignoredBuiltDependencies:\n  - nan\n",
+    ));
+    fs::write(&yaml_path, yaml).expect("write pnpm-workspace.yaml");
+
+    pacquet(&workspace).with_args(["approve-builds", PREPOST]).assert().success();
+
+    let yaml = fs::read_to_string(&yaml_path).expect("read pnpm-workspace.yaml");
+    for key in [
+        "onlyBuiltDependencies",
+        "onlyBuiltDependenciesFile",
+        "neverBuiltDependencies",
+        "ignoredBuiltDependencies",
+    ] {
+        assert!(!yaml.contains(key), "legacy setting {key} must be cleared: {yaml}");
+    }
+    assert_eq!(allow_builds(&workspace).get(PREPOST), Some(&true), "approved package recorded");
 
     drop(harness);
 }

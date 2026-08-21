@@ -10,6 +10,7 @@ import { esmNodePathLoaderImportFlag } from '@pnpm/exec.esm-node-path-loader'
 import { prepare, prepareEmpty } from '@pnpm/prepare'
 import { fixtures } from '@pnpm/test-fixtures'
 import { isCI } from 'ci-info'
+import isWindows from 'is-windows'
 import PATH from 'path-name'
 import { symlinkDir } from 'symlink-dir'
 import { writeYamlFileSync } from 'write-yaml-file'
@@ -33,6 +34,7 @@ for (const suffix of [
 ]) {
   delete process.env[`npm_config_${suffix}`]
   delete process.env[`pnpm_config_${suffix}`]
+  delete process.env[`PNPM_CONFIG_${suffix.toUpperCase()}`]
 }
 
 const env = {
@@ -40,6 +42,7 @@ const env = {
   [PATH]: path.join(import.meta.dirname, 'bin'),
 }
 const f = fixtures(import.meta.dirname)
+const testOnPosix = isWindows() ? test.skip : test
 
 test('getConfig()', async () => {
   const { config } = await getConfig({
@@ -100,6 +103,63 @@ test('nodeVersion from config takes priority over devEngines.runtime', async () 
   const { config } = await getConfig({
     cliOptions: {
       'node-version': '20.0.0',
+    },
+    packageManager: {
+      name: 'pnpm',
+      version: '1.0.0',
+    },
+  })
+
+  expect(config.nodeVersion).toBe('20.0.0')
+})
+
+test('nodeVersion is read from the PNPM_CONFIG_NODE_VERSION environment variable', async () => {
+  const { config } = await getConfig({
+    cliOptions: {},
+    env: {
+      PNPM_CONFIG_NODE_VERSION: '20.0.0',
+    },
+    packageManager: {
+      name: 'pnpm',
+      version: '1.0.0',
+    },
+  })
+
+  expect(config.nodeVersion).toBe('20.0.0')
+})
+
+test('nodeVersion from PNPM_CONFIG_NODE_VERSION takes priority over devEngines.runtime', async () => {
+  prepare({
+    devEngines: {
+      runtime: {
+        name: 'node',
+        version: '22.20.0',
+        onFail: 'download',
+      },
+    },
+  })
+
+  const { config } = await getConfig({
+    cliOptions: {},
+    env: {
+      PNPM_CONFIG_NODE_VERSION: '20.0.0',
+    },
+    packageManager: {
+      name: 'pnpm',
+      version: '1.0.0',
+    },
+  })
+
+  expect(config.nodeVersion).toBe('20.0.0')
+})
+
+test('nodeVersion from config takes priority over PNPM_CONFIG_NODE_VERSION', async () => {
+  const { config } = await getConfig({
+    cliOptions: {
+      'node-version': '20.0.0',
+    },
+    env: {
+      PNPM_CONFIG_NODE_VERSION: '22.20.0',
     },
     packageManager: {
       name: 'pnpm',
@@ -3703,6 +3763,28 @@ test('preferSymlinkedExecutables should be true when nodeLinker is hoisted', asy
   expect(config.preferSymlinkedExecutables).toBeTruthy()
 })
 
+testOnPosix('NODE_PATH points to the virtual store of the workspace root when pnpm runs from a workspace package', async () => {
+  prepareEmpty()
+
+  const workspaceDir = process.cwd()
+  const pkgDir = path.join(workspaceDir, 'packages/app')
+  fs.mkdirSync(pkgDir, { recursive: true })
+
+  const { config } = await getConfig({
+    cliOptions: {
+      dir: pkgDir,
+      'prefer-symlinked-executables': true,
+    },
+    packageManager: {
+      name: 'pnpm',
+      version: '1.0.0',
+    },
+    workspaceDir,
+  })
+
+  expect(config.extraEnv['NODE_PATH']).toBe(path.join(workspaceDir, 'node_modules/.pnpm/node_modules'))
+})
+
 test('return a warning when the .npmrc has an env variable that does not exist', async () => {
   prepare()
 
@@ -3920,6 +4002,36 @@ test('loads setting from environment variable pnpm_config_*', async () => {
   expect(config.trustPolicyExclude).toStrictEqual(['foo', 'bar'])
   expect(config.registry).toBe('https://registry.example.com/')
   expect(config.registriesByScope.default).toBe('https://registry.example.com/')
+})
+
+// The two boolean rows only pin down parsing, not runtime meaning. `false` turns the
+// check off. Bare `true` turns the check on but selects none of the four actions, because
+// `runDepsStatusCheck` switches on the string modes alone. That is the behavior pnpm has
+// always had for this setting, and `VerifyDepsBeforeRun` in `Config.ts` keeps `true` out of
+// the type on purpose. The Rust config crate models it the same way, as a `True` variant that
+// maps to no action (`pnpm/crates/config/src/lib.rs`). Keep these rows as a record of what the
+// parser returns; do not read them as a promise that bare `true` does an install.
+test.each([
+  ['install', 'install'],
+  ['warn', 'warn'],
+  ['error', 'error'],
+  ['prompt', 'prompt'],
+  ['true', true],
+  ['false', false],
+])('loads verifyDepsBeforeRun=%s from environment variable pnpm_config_*', async (envValue: string, expectedValue: string | boolean) => {
+  prepareEmpty()
+  const { config } = await getConfig({
+    cliOptions: {},
+    env: {
+      PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN: envValue,
+    },
+    packageManager: {
+      name: 'pnpm',
+      version: '1.0.0',
+    },
+    workspaceDir: process.cwd(),
+  })
+  expect(config.verifyDepsBeforeRun).toBe(expectedValue)
 })
 
 test('environment variable pnpm_config_* should override pnpm-workspace.yaml', async () => {
